@@ -31,8 +31,9 @@ from pypdf import PdfReader
 # --------------------------------------------------------------------------------------
 # Settings
 # --------------------------------------------------------------------------------------
-# Verify current model names at https://console.groq.com/docs/models (they change over time).
-MODELS = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
+# Groq retires models often (the old Llama 3.x ones were shut down for free keys on 16 Aug 2026).
+# Check current names at https://console.groq.com/docs/models and edit this list if you get a 404.
+MODELS = ["openai/gpt-oss-120b", "openai/gpt-oss-20b"]
 MAX_FILE_MB = 5
 MAX_RESUME_CHARS = 12000  # keeps the request small and inside rate limits
 MAX_JD_CHARS = 5000
@@ -245,6 +246,37 @@ def normalize(result: dict) -> dict:
     }
 
 
+def _model_is_gone(exc: Exception) -> bool:
+    """True when Groq says the model does not exist / was retired."""
+    if getattr(exc, "status_code", None) == 404:
+        return True
+    msg = str(exc).lower()
+    return "model" in msg and any(w in msg for w in ("decommission", "does not exist", "not found", "deprecated"))
+
+
+def _call_model(client, model: str, messages: list) -> str:
+    """One model, with graceful fallbacks if it rejects JSON mode or extra parameters."""
+    base = dict(model=model, messages=messages, temperature=0.2, max_tokens=4000)
+    extras = {}
+    if model.startswith("openai/gpt-oss"):
+        # gpt-oss "thinks" first; keep that short so the JSON answer is not cut off
+        extras = {"reasoning_effort": "low", "include_reasoning": False}
+    attempts = [
+        dict(base, response_format={"type": "json_object"}, **({"extra_body": extras} if extras else {})),
+        dict(base),  # plain mode
+    ]
+    last_exc = None
+    for kwargs in attempts:
+        try:
+            resp = client.chat.completions.create(**kwargs)
+            return resp.choices[0].message.content or ""
+        except BadRequestError as exc:
+            if _model_is_gone(exc):
+                raise
+            last_exc = exc  # probably JSON mode / extra params not supported -> try plain
+    raise last_exc
+
+
 def analyze_with_groq(api_key: str, model: str, resume_text: str, job_desc: str = "") -> dict:
     client = Groq(api_key=api_key, timeout=60.0, max_retries=2)
 
@@ -253,21 +285,23 @@ def analyze_with_groq(api_key: str, model: str, resume_text: str, job_desc: str 
         user_msg += f"<job_description>\n{job_desc.strip()[:MAX_JD_CHARS]}\n</job_description>"
     else:
         user_msg += "<job_description>None provided. Judge against the role the resume targets.</job_description>"
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": user_msg}]
 
-    kwargs = dict(
-        model=model,
-        messages=[{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": user_msg}],
-        temperature=0.2,
-        max_tokens=2500,
-    )
-    try:
-        resp = client.chat.completions.create(response_format={"type": "json_object"}, **kwargs)
-    except BadRequestError:
-        # some models do not support JSON mode -> retry in normal mode
-        resp = client.chat.completions.create(**kwargs)
-
-    raw = resp.choices[0].message.content or ""
-    return normalize(extract_json(raw))
+    # Try the chosen model first; if Groq says it no longer exists, try the others in MODELS.
+    candidates = [model] + [m for m in MODELS if m != model]
+    last_exc = None
+    for m in candidates:
+        try:
+            raw = _call_model(client, m, messages)
+            result = normalize(extract_json(raw))
+            result["_model_used"] = m
+            return result
+        except (APIStatusError, BadRequestError) as exc:
+            if _model_is_gone(exc):
+                last_exc = exc
+                continue
+            raise
+    raise last_exc
 
 
 def final_score(ai: dict, rules: dict) -> tuple[int, int]:
@@ -320,11 +354,15 @@ def friendly_error(exc: Exception) -> str:
     if isinstance(exc, AuthenticationError):
         return "Invalid Groq API key. Create a new one at console.groq.com/keys."
     if isinstance(exc, RateLimitError):
-        return "Groq rate limit reached. Wait a minute and try again, or switch to the 8B model."
+        return "Groq rate limit reached. Wait a minute and try again, or switch to the 20B model."
     if isinstance(exc, APIConnectionError):
         return "Could not connect to Groq. Check your internet connection."
     if isinstance(exc, APIStatusError):
-        return f"Groq returned an error ({exc.status_code}). The model name may be outdated - pick another model in the sidebar."
+        if _model_is_gone(exc):
+            return ("Groq says this model no longer exists, and the fallback models failed too. "
+                    "Open console.groq.com/docs/models, copy a current model ID, and paste it in the sidebar "
+                    "under 'Custom model ID'.")
+        return f"Groq returned an error ({exc.status_code}): {exc}"
     if isinstance(exc, (json.JSONDecodeError, KeyError, IndexError)):
         return "The AI returned an unreadable answer. Please click Analyze again."
     return f"Unexpected error: {type(exc).__name__}: {exc}"
@@ -343,7 +381,10 @@ def main():
             help="Get a free key at console.groq.com/keys",
         )
         api_key = typed_key.strip() or default_key
-        model = st.selectbox("Model", MODELS, help="70B is more accurate, 8B is faster.")
+        model = st.selectbox("Model", MODELS, help="120B is more accurate, 20B is faster.")
+        custom_model = st.text_input("Custom model ID (optional)", placeholder="e.g. openai/gpt-oss-120b",
+                                     help="Overrides the list above. Find current IDs at console.groq.com/docs/models")
+        model = custom_model.strip() or model
         st.divider()
         st.caption("🔒 Your resume text is sent to Groq for analysis. It is not stored by this app.")
 
@@ -391,6 +432,7 @@ def main():
             st.metric("Estimated ATS score", f"{final}/100")
             st.markdown(f"**{score_label(final)}**")
             st.caption(f"Target role detected: {ai['detected_role']}")
+            st.caption(f"Model used: {ai.get('_model_used', model)}")
         with c2:
             st.write(ai["summary"])
             for key, label in AI_LABELS.items():
@@ -407,7 +449,7 @@ def main():
             st.subheader("What to fix")
             icons = {"high": "🔴", "medium": "🟠", "low": "🟢"}
             if not ai["issues"]:
-                st.info("No issues returned. Try again or use the 70B model.")
+                st.info("No issues returned. Try again or pick the 120B model.")
             for i in ai["issues"]:
                 with st.expander(f"{icons[i['priority']]} {i['problem']}", expanded=i["priority"] == "high"):
                     st.markdown(f"**Fix:** {i['fix']}")

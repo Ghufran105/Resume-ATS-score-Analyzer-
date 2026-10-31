@@ -51,7 +51,7 @@ Get a free key at <https://console.groq.com/keys>.
 
 ## Changing the model
 
-Edit the `MODELS` list at the top of `app.py`. Groq retires models from time to time, so check the
+Use the "Custom model ID" box in the sidebar, or edit the `MODELS` list at the top of `app.py`. Groq retires models often (the old Llama 3.x models stopped working for free keys on 16 Aug 2026), so check the
 current list at <https://console.groq.com/docs/models>.
 
 ## Limits
